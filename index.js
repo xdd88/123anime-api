@@ -210,22 +210,21 @@ async function fetchEpisodeList(slug) {
   const episodes = [];
 
   $('a[data-id]').each((_, el) => {
-    const $a        = $(el);
-    const episodeId = $a.attr('data-id');
-    const base      = $a.attr('data-base');
-    const href      = $a.attr('href');
-    const num       = parseInt(base || $a.text().trim(), 10);
-    const parts     = (episodeId || '').split('/');
-    const epSlug    = parts[0] || slug;
-    const epNum     = parts[1] || String(num);
-    const liId      = $a.closest('li').attr('id');
+    const $a    = $(el);
+    const base  = $a.attr('data-base');
+    const href  = $a.attr('href');
+    const num   = parseInt(base || $a.text().trim(), 10);
+    const parts = ($a.attr('data-id') || '').split('/');
+    const epSlug = parts[0] || slug;
+    const epNum  = parts[1] || String(num);
+    const liId   = $a.closest('li').attr('id');
 
     if (!isNaN(num)) {
       episodes.push({
         episode:   num,
         label:     `Episode ${num}`,
         slug:      epSlug,
-        episodeId,
+        episodeId: `${epSlug}/episode/${epNum}`,
         url:       href ? `${BASE}${href}` : '',
         m3u8:      `https://hlsx3cdn.echovideo.to/${epSlug}/${epNum}/master.m3u8`,
         isFirst:   liId === 'str',
@@ -399,7 +398,7 @@ app.get('/', (req, res) => {
         method: 'GET',
         path: '/watch/anime/:slug/episode/:episode',
         description: 'Get M3U8 stream URLs for a specific episode',
-  example: '/watch/anime/sword-art-online/episode/1',
+        example: '/watch/anime/sword-art-online/episode/1',
       },
       debug: {
         method: 'GET',
@@ -543,7 +542,7 @@ app.get('/watch/anime/:slug/episode/:episode', async (req, res) => {
       }
     }
 
-    res.json({ success: true, slug, episode: parseInt(episode, 10), episodeId: `${slug}/${episode}`, source: m3u8Url, streamCount: streams.length, streams });
+    res.json({ success: true, slug, episode: parseInt(episode, 10), episodeId: `${slug}/episode/${episode}`, source: m3u8Url, streamCount: streams.length, streams });
   } catch (err) {
     res.status(500).json({ success: false, slug, episode, error: err.message });
   }
