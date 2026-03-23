@@ -101,14 +101,12 @@ function toSlug(title) {
 function slugVariations(title) {
   const base = toSlug(title);
   const set  = new Set([base]);
-  // common suffixes 123animes appends
   set.add(base + '-tv');
   set.add(base + '-dub');
   set.add(base + '-sub');
   set.add(base + '-english-dub');
   set.add(base + '-ova');
   set.add(base + '-ona');
-  // strip trailing season/part indicators then re-add with -tv
   const stripped = base.replace(/-season-\d+$/, '').replace(/-part-\d+$/, '').replace(/-\d+$/, '');
   set.add(stripped);
   set.add(stripped + '-tv');
@@ -124,7 +122,6 @@ async function checkSlugExists(slug) {
     });
     if (r.status !== 200) return false;
     const html = typeof r.data === 'string' ? r.data : '';
-    // Reject obvious home/404 pages that don't contain the slug in any link
     const lowerHtml = html.toLowerCase();
     return (
       lowerHtml.includes(`/anime/${slug}`) ||
@@ -156,7 +153,6 @@ async function search123Slug(titles) {
       });
       const $ = cheerio.load(data);
 
-      // Debug: log what selectors find something
       const allAnimeLinks = new Map();
       $('a').each((_, el) => {
         const href = $(el).attr('href') || '';
@@ -192,7 +188,7 @@ async function search123Slug(titles) {
 
       console.log(`[123animes] Best match: "${scored[0]?.slug}" (score ${scored[0]?.score}) text="${scored[0]?.text}"`);
 
-      if (scored[0]?.score >= 15) return scored[0].slug;  // lowered from 20
+      if (scored[0]?.score >= 15) return scored[0].slug;
 
     } catch (e) {
       console.warn(`[123animes] Search "${title}" failed:`, e.message);
@@ -386,6 +382,40 @@ function mergeEpisodesWithTMDB(episodes, lookup) {
   });
 }
 
+// ─── Route: GET / ─────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    name: 'Anime API',
+    version: '1.0.0',
+    endpoints: {
+      details: {
+        method: 'GET',
+        path: '/details/anime/:anilistId',
+        description: 'Fetch anime details + episode list with TMDB enrichment',
+        example: '/details/anime/11757',
+      },
+      watch: {
+        method: 'GET',
+        path: '/watch/anime/:slug/episode/:episode',
+        description: 'Get M3U8 stream URLs for a specific episode',
+        example: '/watch/anime/sword-art-online-tv/1',
+      },
+      debug: {
+        method: 'GET',
+        path: '/debug/slug/:anilistId',
+        description: 'Diagnose slug resolution for an anime',
+        example: '/debug/slug/11757',
+      },
+    },
+    examples: {
+      sao:         '/details/anime/11757',
+      aot:         '/details/anime/16498',
+      demonSlayer: '/details/anime/166240',
+    },
+  });
+});
+
 // ─── Route: GET /details/anime/:anilistId ─────────────────────────────────────
 app.get('/details/anime/:anilistId', async (req, res) => {
   const { anilistId } = req.params;
@@ -454,7 +484,6 @@ app.get('/details/anime/:anilistId', async (req, res) => {
 });
 
 // ─── Route: GET /debug/slug/:anilistId ───────────────────────────────────────
-// Use this to diagnose why an anime isn't being found
 app.get('/debug/slug/:anilistId', async (req, res) => {
   const { anilistId } = req.params;
   try {
@@ -469,7 +498,6 @@ app.get('/debug/slug/:anilistId', async (req, res) => {
     const asciiTitles = allTitles.filter(t => !/[^\x00-\x7F]/.test(t));
     const slugsToTry  = asciiTitles.flatMap(slugVariations);
 
-    // Check each slug
     const slugChecks = await Promise.all(
       [...new Set(slugsToTry)].map(async (slug) => ({
         slug,
@@ -525,8 +553,10 @@ app.get('/watch/anime/:slug/episode/:episode', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`\nServer running → http://localhost:${PORT}`);
   console.log('\nEndpoints:');
+  console.log('  GET /                                → API info & endpoint list');
   console.log('  GET /details/anime/:anilistId        → auto-find on 123animes + TMDB enrichment');
   console.log('  GET /watch/anime/:slug/episode/:ep   → M3U8 streams');
+  console.log('  GET /debug/slug/:anilistId           → diagnose slug resolution');
   console.log('\nExamples:');
   console.log('  http://localhost:3000/details/anime/11757    (SAO)');
   console.log('  http://localhost:3000/details/anime/16498    (AoT)');
