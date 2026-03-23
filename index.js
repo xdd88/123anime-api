@@ -399,7 +399,7 @@ app.get('/', (req, res) => {
         method: 'GET',
         path: '/watch/anime/:slug/episode/:episode',
         description: 'Get M3U8 stream URLs for a specific episode',
-        example: '/watch/anime/sword-art-online-tv/1',
+  example: '/watch/anime/sword-art-online/episode/1',
       },
       debug: {
         method: 'GET',
