@@ -198,6 +198,22 @@ async function search123Slug(titles) {
   return null;
 }
 
+// ─── Dub slug detection ───────────────────────────────────────────────────────
+const DUB_SUFFIXES = ['-dub', '-english-dub', '-dubbed'];
+
+async function findDubSlug(mainSlug) {
+  for (const suffix of DUB_SUFFIXES) {
+    const dubSlug = mainSlug + suffix;
+    const exists  = await checkSlugExists(dubSlug);
+    if (exists) {
+      console.log(`[123animes] Dub slug found: "${dubSlug}"`);
+      return dubSlug;
+    }
+  }
+  console.log(`[123animes] No dub slug found for "${mainSlug}"`);
+  return null;
+}
+
 // ─── 123animes scraping ───────────────────────────────────────────────────────
 async function fetchEpisodeList(slug) {
   const ts = Date.now();
@@ -391,7 +407,7 @@ app.get('/', (req, res) => {
       details: {
         method: 'GET',
         path: '/details/anime/:anilistId',
-        description: 'Fetch anime details + episode list with TMDB enrichment',
+        description: 'Fetch anime details + episode list with TMDB enrichment (includes dub if available)',
         example: '/details/anime/11757',
       },
       watch: {
@@ -432,7 +448,7 @@ app.get('/details/anime/:anilistId', async (req, res) => {
       ...(media.synonyms || []),
     ].filter(Boolean);
 
-    // 2 — Find slug on 123animes (cached)
+    // 2 — Find sub slug on 123animes (cached)
     const slugCacheKey = `slug_123_${anilistId}`;
     let slug = cacheGet(slugCacheKey);
     if (!slug) {
@@ -448,10 +464,24 @@ app.get('/details/anime/:anilistId', async (req, res) => {
       });
     }
 
-    // 3 — Scrape 123animes
-    const data = await scrapeAnimePage(slug);
+    // 3 — Find dub slug (cached; empty string sentinel = no dub)
+    const dubSlugCacheKey = `slug_123_dub_${anilistId}`;
+    let dubSlugRaw = cacheGet(dubSlugCacheKey);
+    if (dubSlugRaw === null) {
+      // null means cache miss — run detection
+      const found = await findDubSlug(slug);
+      dubSlugRaw = found || '';                        // '' = confirmed no dub
+      cacheSet(dubSlugCacheKey, dubSlugRaw, 24 * 60 * 60 * 1000);
+    }
+    const dubSlug = dubSlugRaw || null;                // expose null externally
 
-    // 4 — TMDB enrichment
+    // 4 — Scrape sub + dub pages in parallel
+    const [data, dubData] = await Promise.all([
+      scrapeAnimePage(slug),
+      dubSlug ? scrapeAnimePage(dubSlug) : Promise.resolve(null),
+    ]);
+
+    // 5 — TMDB enrichment (applied to both sub and dub episodes)
     let tmdbId = externalIds.tmdb || null;
     if (!tmdbId) {
       const t = media.title?.english || media.title?.romaji;
@@ -461,8 +491,9 @@ app.get('/details/anime/:anilistId', async (req, res) => {
       const targetYear = media.startDate?.year || null;
       const tmdbEps    = await fetchTMDBEpisodes(tmdbId, targetYear);
       if (tmdbEps.length) {
-        const lookup  = buildTMDBLookup(tmdbEps);
-        data.episodes = mergeEpisodesWithTMDB(data.episodes, lookup);
+        const lookup      = buildTMDBLookup(tmdbEps);
+        data.episodes     = mergeEpisodesWithTMDB(data.episodes, lookup);
+        if (dubData) dubData.episodes = mergeEpisodesWithTMDB(dubData.episodes, lookup);
         data.enriched     = true;
         data.metaSource   = 'tmdb';
         data.tmdbSeriesId = tmdbId;
@@ -471,7 +502,28 @@ app.get('/details/anime/:anilistId', async (req, res) => {
       data.enriched = false;
     }
 
-    // 5 — Attach identifiers
+    // 6 — Merge dub info inline into each matching sub episode
+    data.hasDub  = dubSlug !== null;
+    data.dubSlug = dubSlug;
+
+    if (dubSlug && dubData?.episodes?.length) {
+      const dubByNum = new Map(dubData.episodes.map(ep => [ep.episode, ep]));
+      data.episodes = data.episodes.map(ep => {
+        const dubEp = dubByNum.get(ep.episode);
+        if (!dubEp) return ep;
+        return {
+          ...ep,
+          dub: {
+            slug:      dubEp.slug,
+            episodeId: dubEp.episodeId,
+            url:       dubEp.url,
+            m3u8:      dubEp.m3u8,
+          },
+        };
+      });
+    }
+
+    // 7 — Attach identifiers
     data.anilistId   = parseInt(anilistId);
     data.externalIds = externalIds;
 
@@ -553,7 +605,7 @@ app.listen(PORT, () => {
   console.log(`\nServer running → http://localhost:${PORT}`);
   console.log('\nEndpoints:');
   console.log('  GET /                                → API info & endpoint list');
-  console.log('  GET /details/anime/:anilistId        → auto-find on 123animes + TMDB enrichment');
+  console.log('  GET /details/anime/:anilistId        → auto-find on 123animes + TMDB enrichment + dub');
   console.log('  GET /watch/anime/:slug/episode/:ep   → M3U8 streams');
   console.log('  GET /debug/slug/:anilistId           → diagnose slug resolution');
   console.log('\nExamples:');
