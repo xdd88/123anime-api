@@ -87,8 +87,14 @@ function extractExternalIds(media) {
   return Object.fromEntries(Object.entries(ids).filter(([, v]) => v != null));
 }
 
-// ─── 123animes slug search ────────────────────────────────────────────────────
-const BASE = 'https://w1.123animes.ru';
+// ─── 123animes slug helpers ───────────────────────────────────────────────────
+
+// Japanese number-word → digit map
+const JP_NUMBER_WORDS = {
+  ichi: '1', ni: '2', san: '3', shi: '4', yon: '4',
+  go: '5', roku: '6', shichi: '7', nana: '7', hachi: '8',
+  ku: '9', kyuu: '9', juu: '10',
+};
 
 function toSlug(title) {
   return title.toLowerCase()
@@ -98,20 +104,101 @@ function toSlug(title) {
     .replace(/-+/g, '-');
 }
 
+/** Replace isolated number-words with digits, e.g. "-ichi-" → "-1-" */
+function applyNumberWords(slug) {
+  let result = slug;
+  for (const [word, digit] of Object.entries(JP_NUMBER_WORDS)) {
+    result = result.replace(
+      new RegExp(`(?<=-|^)${word}(?=-|$)`, 'g'),
+      digit
+    );
+  }
+  return result;
+}
+
+/**
+ * Returns a Set of slugs, each with exactly ONE consecutive short-particle
+ * pair (≤2 chars each) fused, plus an "all fused" variant.
+ *
+ * e.g. "a-no-de-b-ko-ga-c" produces:
+ *   "a-node-b-ko-ga-c"   ← only no+de fused  ✅
+ *   "a-no-de-b-koga-c"   ← only ko+ga fused
+ *   "a-node-b-koga-c"    ← all fused
+ *
+ * This avoids the greedy-fuse bug where one global replace produces
+ * "koga-ita-node" — a slug that never exists — instead of the correct
+ * "ko-ga-ita-node".
+ */
+function getFusedVariants(slug) {
+  const variants = new Set();
+
+  // ── Individual fusions: one pair at a time ────────────────────────────────
+  // Match -xx-yy where xx,yy ≤2 chars, followed by - or end-of-string
+  const re = /-([a-z]{1,2})-([a-z]{1,2})(?=-|$)/g;
+  let m;
+  while ((m = re.exec(slug)) !== null) {
+    const before = slug.slice(0, m.index);
+    const after  = slug.slice(m.index + m[0].length);
+    variants.add(`${before}-${m[1]}${m[2]}${after}`);
+    // move back one so overlapping pairs are also found
+    re.lastIndex = m.index + 1;
+  }
+
+  // ── "Fuse all" variant (two passes for triple-particle chains) ────────────
+  let allFused = slug;
+  for (let i = 0; i < 2; i++) {
+    allFused = allFused
+      .replace(/-([a-z]{1,2})-([a-z]{1,2})-/g, (_, a, b) => `-${a}${b}-`)
+      .replace(/-([a-z]{1,2})-([a-z]{1,2})$/, (_, a, b) => `-${a}${b}`);
+  }
+  if (allFused !== slug) variants.add(allFused);
+
+  return variants;
+}
+
 function slugVariations(title) {
-  const base = toSlug(title);
-  const set  = new Set([base]);
-  set.add(base + '-tv');
-  set.add(base + '-dub');
-  set.add(base + '-sub');
-  set.add(base + '-english-dub');
-  set.add(base + '-ova');
-  set.add(base + '-ona');
-  const stripped = base.replace(/-season-\d+$/, '').replace(/-part-\d+$/, '').replace(/-\d+$/, '');
-  set.add(stripped);
-  set.add(stripped + '-tv');
+  const base    = toSlug(title);
+  const numeric = applyNumberWords(base);   // Fix 1: "ichi" → "1" etc.
+  const set     = new Set([base]);
+
+  // Collect all root forms (base + number-substituted)
+  const roots = [...new Set([base, numeric])];
+
+  for (const root of roots) {
+    set.add(root);
+
+    // Fix 2: all single-pair and all-pair fusions
+    for (const fused of getFusedVariants(root)) {
+      set.add(fused);
+      // Suffix variants on every fused form too
+      set.add(fused + '-tv');
+      set.add(fused + '-dub');
+    }
+
+    // Common suffix variants on the root itself
+    set.add(root + '-tv');
+    set.add(root + '-dub');
+    set.add(root + '-sub');
+    set.add(root + '-english-dub');
+    set.add(root + '-ova');
+    set.add(root + '-ona');
+
+    // Strip trailing season/part/number
+    const stripped = root
+      .replace(/-season-\d+$/, '')
+      .replace(/-part-\d+$/, '')
+      .replace(/-\d+$/, '');
+    if (stripped !== root) {
+      set.add(stripped);
+      set.add(stripped + '-tv');
+      for (const fused of getFusedVariants(stripped)) set.add(fused);
+    }
+  }
+
   return [...set].filter(s => s.length > 1);
 }
+
+const BASE = 'https://w1.123animes.ru';
 
 async function checkSlugExists(slug) {
   try {
@@ -135,7 +222,7 @@ async function checkSlugExists(slug) {
 async function search123Slug(titles) {
   const asciiTitles = titles.filter(t => t && !/[^\x00-\x7F]/.test(t));
 
-  // Strategy 1 — try direct slug + common variations
+  // Strategy 1 — try direct slug + all variations
   for (const title of asciiTitles) {
     for (const slug of slugVariations(title)) {
       if (await checkSlugExists(slug)) {
@@ -176,13 +263,15 @@ async function search123Slug(titles) {
         const sSlug = slug.toLowerCase();
         const sText = text.toLowerCase();
         let score = 0;
-        if (sSlug === titleSlug)                  score += 200;
-        else if (sSlug.startsWith(titleSlug))     score += 100;
-        else if (sSlug.includes(titleSlug))       score += 60;
-        if (sText === titleLower)                 score += 150;
-        else if (sText.includes(titleLower))      score += 50;
+        if (sSlug === titleSlug)              score += 200;
+        else if (sSlug.startsWith(titleSlug)) score += 100;
+        else if (sSlug.includes(titleSlug))   score += 60;
+        if (sText === titleLower)             score += 150;
+        else if (sText.includes(titleLower))  score += 50;
         const matched = titleWords.filter(w => sSlug.includes(w) || sText.includes(w));
         score += (matched.length / Math.max(titleWords.length, 1)) * 40;
+        // Boost when most words match even if slug doesn't fully align
+        if (matched.length >= titleWords.length * 0.75) score += 30;
         return { slug, text, score };
       }).sort((a, b) => b.score - a.score);
 
@@ -468,12 +557,11 @@ app.get('/details/anime/:anilistId', async (req, res) => {
     const dubSlugCacheKey = `slug_123_dub_${anilistId}`;
     let dubSlugRaw = cacheGet(dubSlugCacheKey);
     if (dubSlugRaw === null) {
-      // null means cache miss — run detection
       const found = await findDubSlug(slug);
-      dubSlugRaw = found || '';                        // '' = confirmed no dub
+      dubSlugRaw = found || '';
       cacheSet(dubSlugCacheKey, dubSlugRaw, 24 * 60 * 60 * 1000);
     }
-    const dubSlug = dubSlugRaw || null;                // expose null externally
+    const dubSlug = dubSlugRaw || null;
 
     // 4 — Scrape sub + dub pages in parallel
     const [data, dubData] = await Promise.all([
@@ -481,7 +569,7 @@ app.get('/details/anime/:anilistId', async (req, res) => {
       dubSlug ? scrapeAnimePage(dubSlug) : Promise.resolve(null),
     ]);
 
-    // 5 — TMDB enrichment (applied to both sub and dub episodes)
+    // 5 — TMDB enrichment
     let tmdbId = externalIds.tmdb || null;
     if (!tmdbId) {
       const t = media.title?.english || media.title?.romaji;
