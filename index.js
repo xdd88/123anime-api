@@ -119,32 +119,19 @@ function applyNumberWords(slug) {
 /**
  * Returns a Set of slugs, each with exactly ONE consecutive short-particle
  * pair (≤2 chars each) fused, plus an "all fused" variant.
- *
- * e.g. "a-no-de-b-ko-ga-c" produces:
- *   "a-node-b-ko-ga-c"   ← only no+de fused  ✅
- *   "a-no-de-b-koga-c"   ← only ko+ga fused
- *   "a-node-b-koga-c"    ← all fused
- *
- * This avoids the greedy-fuse bug where one global replace produces
- * "koga-ita-node" — a slug that never exists — instead of the correct
- * "ko-ga-ita-node".
  */
 function getFusedVariants(slug) {
   const variants = new Set();
 
-  // ── Individual fusions: one pair at a time ────────────────────────────────
-  // Match -xx-yy where xx,yy ≤2 chars, followed by - or end-of-string
   const re = /-([a-z]{1,2})-([a-z]{1,2})(?=-|$)/g;
   let m;
   while ((m = re.exec(slug)) !== null) {
     const before = slug.slice(0, m.index);
     const after  = slug.slice(m.index + m[0].length);
     variants.add(`${before}-${m[1]}${m[2]}${after}`);
-    // move back one so overlapping pairs are also found
     re.lastIndex = m.index + 1;
   }
 
-  // ── "Fuse all" variant (two passes for triple-particle chains) ────────────
   let allFused = slug;
   for (let i = 0; i < 2; i++) {
     allFused = allFused
@@ -158,24 +145,20 @@ function getFusedVariants(slug) {
 
 function slugVariations(title) {
   const base    = toSlug(title);
-  const numeric = applyNumberWords(base);   // Fix 1: "ichi" → "1" etc.
+  const numeric = applyNumberWords(base);
   const set     = new Set([base]);
 
-  // Collect all root forms (base + number-substituted)
   const roots = [...new Set([base, numeric])];
 
   for (const root of roots) {
     set.add(root);
 
-    // Fix 2: all single-pair and all-pair fusions
     for (const fused of getFusedVariants(root)) {
       set.add(fused);
-      // Suffix variants on every fused form too
       set.add(fused + '-tv');
       set.add(fused + '-dub');
     }
 
-    // Common suffix variants on the root itself
     set.add(root + '-tv');
     set.add(root + '-dub');
     set.add(root + '-sub');
@@ -183,7 +166,6 @@ function slugVariations(title) {
     set.add(root + '-ova');
     set.add(root + '-ona');
 
-    // Strip trailing season/part/number
     const stripped = root
       .replace(/-season-\d+$/, '')
       .replace(/-part-\d+$/, '')
@@ -270,7 +252,6 @@ async function search123Slug(titles) {
         else if (sText.includes(titleLower))  score += 50;
         const matched = titleWords.filter(w => sSlug.includes(w) || sText.includes(w));
         score += (matched.length / Math.max(titleWords.length, 1)) * 40;
-        // Boost when most words match even if slug doesn't fully align
         if (matched.length >= titleWords.length * 0.75) score += 30;
         return { slug, text, score };
       }).sort((a, b) => b.score - a.score);
@@ -499,6 +480,12 @@ app.get('/', (req, res) => {
         description: 'Fetch anime details + episode list with TMDB enrichment (includes dub if available)',
         example: '/details/anime/11757',
       },
+      bySlug: {
+        method: 'GET',
+        path: '/anime/:slug',
+        description: 'Fetch anime details directly by 123animes slug, no AniList ID needed',
+        example: '/anime/sword-art-online',
+      },
       watch: {
         method: 'GET',
         path: '/watch/anime/:slug/episode/:episode',
@@ -516,6 +503,7 @@ app.get('/', (req, res) => {
       sao:         '/details/anime/11757',
       aot:         '/details/anime/16498',
       demonSlayer: '/details/anime/166240',
+      saoBySlug:   '/anime/sword-art-online',
     },
   });
 });
@@ -622,6 +610,84 @@ app.get('/details/anime/:anilistId', async (req, res) => {
   }
 });
 
+// ─── Route: GET /anime/:slug ──────────────────────────────────────────────────
+app.get('/anime/:slug', async (req, res) => {
+  const { slug } = req.params;
+
+  try {
+    // 1 — Verify the slug exists on 123animes
+    const exists = await checkSlugExists(slug);
+    if (!exists) {
+      return res.status(404).json({
+        success: false,
+        error: `Slug "${slug}" not found on 123animes`,
+        slug,
+      });
+    }
+
+    // 2 — Find dub slug (cached; empty string sentinel = no dub)
+    const dubSlugCacheKey = `slug_123_dub_slug_${slug}`;
+    let dubSlugRaw = cacheGet(dubSlugCacheKey);
+    if (dubSlugRaw === null) {
+      const found = await findDubSlug(slug);
+      dubSlugRaw = found || '';
+      cacheSet(dubSlugCacheKey, dubSlugRaw, 24 * 60 * 60 * 1000);
+    }
+    const dubSlug = dubSlugRaw || null;
+
+    // 3 — Scrape sub + dub pages in parallel
+    const [data, dubData] = await Promise.all([
+      scrapeAnimePage(slug),
+      dubSlug ? scrapeAnimePage(dubSlug) : Promise.resolve(null),
+    ]);
+
+    // 4 — TMDB enrichment (search by scraped title)
+    const searchTitle = data.title || null;
+    let tmdbId = null;
+    if (searchTitle) tmdbId = await searchTMDBByTitle(searchTitle);
+
+    if (tmdbId) {
+      const tmdbEps = await fetchTMDBEpisodes(tmdbId);
+      if (tmdbEps.length) {
+        const lookup      = buildTMDBLookup(tmdbEps);
+        data.episodes     = mergeEpisodesWithTMDB(data.episodes, lookup);
+        if (dubData) dubData.episodes = mergeEpisodesWithTMDB(dubData.episodes, lookup);
+        data.enriched     = true;
+        data.metaSource   = 'tmdb';
+        data.tmdbSeriesId = tmdbId;
+      }
+    } else {
+      data.enriched = false;
+    }
+
+    // 5 — Merge dub info inline into each matching sub episode
+    data.hasDub  = dubSlug !== null;
+    data.dubSlug = dubSlug;
+
+    if (dubSlug && dubData?.episodes?.length) {
+      const dubByNum = new Map(dubData.episodes.map(ep => [ep.episode, ep]));
+      data.episodes = data.episodes.map(ep => {
+        const dubEp = dubByNum.get(ep.episode);
+        if (!dubEp) return ep;
+        return {
+          ...ep,
+          dub: {
+            slug:      dubEp.slug,
+            episodeId: dubEp.episodeId,
+            url:       dubEp.url,
+            m3u8:      dubEp.m3u8,
+          },
+        };
+      });
+    }
+
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('[route /anime/:slug] error:', err.message);
+    res.status(500).json({ success: false, slug, error: err.message });
+  }
+});
+
 // ─── Route: GET /debug/slug/:anilistId ───────────────────────────────────────
 app.get('/debug/slug/:anilistId', async (req, res) => {
   const { anilistId } = req.params;
@@ -693,11 +759,13 @@ app.listen(PORT, () => {
   console.log(`\nServer running → http://localhost:${PORT}`);
   console.log('\nEndpoints:');
   console.log('  GET /                                → API info & endpoint list');
+  console.log('  GET /anime/:slug                     → fetch by slug directly (no AniList)');
   console.log('  GET /details/anime/:anilistId        → auto-find on 123animes + TMDB enrichment + dub');
   console.log('  GET /watch/anime/:slug/episode/:ep   → M3U8 streams');
   console.log('  GET /debug/slug/:anilistId           → diagnose slug resolution');
   console.log('\nExamples:');
-  console.log('  http://localhost:3000/details/anime/11757    (SAO)');
-  console.log('  http://localhost:3000/details/anime/16498    (AoT)');
-  console.log('  http://localhost:3000/details/anime/166240   (Demon Slayer Hashira Training)\n');
+  console.log('  http://localhost:3000/anime/sword-art-online          (SAO by slug)');
+  console.log('  http://localhost:3000/details/anime/11757             (SAO by AniList)');
+  console.log('  http://localhost:3000/details/anime/16498             (AoT)');
+  console.log('  http://localhost:3000/details/anime/166240            (Demon Slayer Hashira Training)\n');
 });
